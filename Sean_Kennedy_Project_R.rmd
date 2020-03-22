@@ -1,0 +1,308 @@
+
+---
+title: "Sean Kennedy: Time Series Project EDA"
+output: html_document
+---
+
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tswge)
+library(zoo)
+library(scales)
+library(tidyverse)
+library(dplyr)
+
+```
+
+### EDA: 
+
+#### Deliverable:
+
+    - a.	Identify yourself and your team (if applicable).  
+    - b.	Describe Data Set / Time Series (Who, What, When, Where, Why and How)
+    - c.	Stationary / Non-Stationary 
+    - d.	ACFs and Spectral Densities just to explore
+    - e.  At least 2 candidate ARMA / ARIMA models
+        - The models in factored form with standard deviation.
+        - AIC
+        - ASE
+        - Visualization of Forecasts with a Practical Horizon. 
+    - f.	Strategy / Plans for the rest of the analysis.
+    
+### Team (a.)
+
+- Sean Kennedy
+
+### Data Set Description (b.)
+
+- Dataset consists of aggregated credit card transaction data from [Earnest Research](https://www.earnestresearch.com/) - a data processing company that performs data cleaning and aggregation on raw credit card data from [Yodlee](https://www.yodlee.com). Yodlee tracks millions of credit card users across the country and sells that **anonymized** data to companies that wish to understand consumer trends and competition at the state and local level. 
+
+- Earnest packages this data up and performs custom panel de-biasing and also tracks a panel of card numbers that are deemed to be representative of the larger population and meet certain minimum spending thresholds. 
+
+- The panel is intended to be static so that it accurately tracks the associated KPI over time. For example, tracking same store sales is a common practice in finance, simply comparing total sales for a company quarter over quarter (QoQ) or year over year (YoY) does not take into account the fact that the number of stores reporting sales could increase or decrease over time. Often, per-unit sales, which are more indicative of company health are used to assess company growth/value.
+
+- This dataset is an aggregation of data from a particular vertical of interests given the current evnironment: **restaurants** 
+
+  Restaurants have been hit hard with sales of late, this analysis aims to model the current downward trend by stripping out the seasonal components of spending and modeling the remining trend.
+  
+- The fields we will be modeling are **panel_sales** and **transaction_count**
+
+- The data set also contains the following:
+  
+    - optimized_date: the date of the transactions
+    
+     - parent_merchant: the merchant
+    
+    - state: state of transaction
+    
+    - region: region of transaction
+    
+    - channel: type of transaction
+    
+    - vertical: merchant sector
+
+- Of particular interest to my firm is **papa_johns** pizza - the analysis will begin with a model for this merchant which we will then extend to the broader pizza industry.
+
+
+```{r}
+data = read.csv('./data/cc_data_daily.csv', stringsAsFactors = TRUE, col.names = c('optimized_date', 'parent_merchant', 'state', 'region', 'channel', 'vertical', 'panel_sales', 'transaction_count'))
+```
+
+### Papa Johns:
+
+- Aggregated, daily data
+- 2538 observations, spanning April 2013 through March 2020
+
+### Dataset Summary
+
+```{r}
+#papa_johns = read.csv('papa_johns.csv', stringsAsFactors=TRUE)
+papa_johns = data %>% filter(parent_merchant=='papa_john')
+papa_johns = papa_johns %>% group_by(optimized_date, parent_merchant) %>%
+  summarise(
+    panel_sales=sum(panel_sales),
+    transaction_count=sum(transaction_count)
+  )
+papa_johns$optimized_date = as.Date(papa_johns$optimized_date)
+summary(papa_johns)
+
+min(papa_johns$optimized_date)
+max(papa_johns$optimized_date)
+#write.csv(papa_johns, 'papa_johns.csv')
+```
+
+
+### Stationary vs Non-Stationary
+
+- Does the mean depend on time?
+
+  Absolutely, in this instance - we should see strong dependence on time. Average sales on Friday will be different than average sales on a Wednesday. We should expect that there is a cyclic pattern to this data. This data doesn't meet the criteria for stationarity.
+
+```{r STATIONARITY}
+
+papa_johns$avg_weekly_sales = rollapply(papa_johns$panel_sales, width=7, FUN=mean, fill=NA)
+
+ggplot(data=papa_johns, aes(x=optimized_date, y=panel_sales, group=1)) +
+  geom_line(color="red")+
+  geom_point() + 
+  scale_y_continuous(labels = dollar)
+
+papa_johns$week_day = weekdays(papa_johns$optimized_date)
+
+daily_averages = papa_johns %>% group_by(week_day) %>% summarize(
+  weekday_average = mean(panel_sales)
+)
+
+ggplot(data = daily_averages) + geom_col(aes(x=week_day, y=weekday_average, group=week_day, fill=week_day)) +
+  ggtitle('Daily Average Pizza Sales') + 
+  scale_y_continuous(labels = dollar)
+
+
+```
+
+### NOTE TO SELF
+
+- This irregularity is likely more pronounced than reality due to the fact that Earnest is not doing a great job of capturing the actual dates of weekend spend and is largely bumping those transactions that should be labeled as sat/sunday as Monday/Tuesday. I would assume that the probabilities of pizza being sold on any given day are less skewed.
+
+
+### Distribution of Sales by Day
+
+- Clearly there exists a trend of higher pizza sales on weekdays as opposed to weekends. Again, this is epected given the nature of the dataset. People tend to cook less and order out more on weekdays in general.
+
+```{r}
+
+papa_johns %>% ggplot(aes(y=panel_sales,x=week_day,fill=week_day,group=week_day))+
+                      geom_violin(show.legend = FALSE)+
+                      xlab("Weekday")+ylab("Sales")+
+                      labs(title="Daily Sales Summary: Papa Johns PZZA", 
+                      caption="Source: Earnest Research")+
+                      theme_classic() +
+                      theme(
+                            legend.position  = "right",
+                            legend.direction ="vertical",
+                            legend.title = element_text(size = rel(0.5))) + 
+                      scale_y_continuous(labels = dollar)
+```
+
+#### Plots (.d):
+
+- Strong evidence of autocorreltions at k=7
+
+- Entirely expected given that the underlying data is daily and that pizza sales are likely correlated to certain days. We can diff the data at lag 7 and apply a seasonal model to see if the residuals are white noise. 
+
+- Spectral density shows strong peaks at 0.15, 0.29, 0.45
+
+```{r}
+x = plotts.sample.wge(papa_johns$panel_sales)
+```
+
+#### PACF Plot
+
+- PACF plot shows oscillatory behavior that is slowly dampening
+
+```{r}
+p = pacf(papa_johns$panel_sales)
+```
+
+### Candidate ARMA Model (.e):
+
+
+- Selected via AIC5 in tswge library
+
+- Both criterion (AIC/BIC) favor an arma(9,1) model
+
+```{r}
+aic5.wge(papa_johns$panel_sales, p=0:10, q=0:1)
+aic5.wge(papa_johns$panel_sales, p=0:10, q=0:1, type = 'bic')
+```
+
+#### ARMA(9,1) Fit
+
+- Roots look great. System frequencies of 0.14, 0.28 and 0.42 strongly match the spectral densities of our realization. 
+
+- Wandering behaviour is also evident given that the frequency at 0
+
+- The other factors of $1-0.5165B$ and $1+0.3678B$  are not well represented, which is expected.
+
+- In full factored form:
+
+$(1+1.194B+0.9365B^2)(1+0.4242B+0.9260B^2)(1+1.5992B+0.7940B^2)(1-0.5165B)(1+0.3678B)(X(t)-87,441.3)=(1-0.997B)a(t)$
+
+$s_a^2= 2,952,946,190$
+
+
+```{r}
+arma_91 = est.arma.wge(papa_johns$panel_sales, p=9, q=1)
+mean_panel = mean(papa_johns$panel_sales)
+arma_91$avar
+mean_panel
+```
+
+#### ARMA(9,1) Forecast/ASE
+
+```{r}
+window = 200
+data = papa_johns$panel_sales
+arma_91_forecasts = fore.arma.wge(data, phi=arma_91$phi, theta = arma_91$theta, n.ahead = window, lastn = TRUE, limits=FALSE, plot = TRUE)
+
+resid = plotts.sample.wge(arma_91_forecasts$resid)
+actuals_91 = data[(length(data)-(window-1)):length(data)]
+ASE_91 = mean((actuals_91 - arma_91_forecasts$f)^2)
+arma_91$aic
+ASE_91
+ljung.wge(arma_91_forecasts$res, p=9, q=1)
+
+```
+
+- Residual plots of ARMA(9,1) appear to be white, but fail the Ljung-Box test
+
+#### Seasonal ARUMA S=7 (e.)
+
+- After stripping out the seasonal behavior by taking a 7th diff transform, we will use BIC criterion to model the transformed data. 
+
+```{r}
+papa_johns_trans = artrans.wge(papa_johns$panel_sales, phi.tr = c(rep(0,6), 1))
+x = plotts.sample.wge(papa_johns_trans)
+mean(papa_johns_trans)
+```
+
+- Transformed data appears to have an MA component with multiple roots (as evidenced from the spectral density)
+
+- Since the residuals still appear non-stationary, we could diff further, but we'll save that for another day
+
+- BIC selects and AR(5,7) model
+
+```{r ARMA_BIC}
+aic5.wge(papa_johns_trans, p=0:7, q=0:7)
+aic5.wge(papa_johns_trans, p=0:7, q=0:7, type='bic')
+
+arma_57 = est.arma.wge(papa_johns_trans, p=5, q=7)
+
+```
+
+- In full factored form:
+
+$(1-0.5557B+0.4365B^2)(1+0.5953B)(1+0.5923B+0.3178B^2)(1-B^7)(X(t)-21.1)=a(t)$
+
+$s_a^2= 1,866,882,628$
+
+- Note that our ARMA(5,7) model does not yield any particularly strong roots (abs reciprocals are rather low) but it does match the system frequencies of our transformed data very well (see spectral density above)
+
+- The oscillitory behavior of the transformed data is also captured with a system frequency of 0.5 being present, though it is not very stong.
+
+
+```{r ARMA_RESID}
+resid = plotts.sample.wge(arma_57$res)
+t = ljung.wge(arma_57$res, p=5, q=7)
+
+```
+- Residual plots of ARMA(5,7) appear to be white, but fail the Ljung-Box test
+
+
+#### Seasonal Forecast/ASE
+
+```{r ARUMA_FORECASTS}
+
+data= papa_johns_trans
+arma_57_forecasts = fore.aruma.wge(papa_johns_trans, s=7, phi=arma_57$phi, theta = arma_57$theta, n.ahead = window, lastn = TRUE, limits=FALSE, plot = TRUE)
+actuals_57 = data[(length(data)-(window-1)):length(data)]
+ASE_57 = mean((actuals_57 - arma_57_forecasts$f)^2)
+arma_57$aic
+ASE_57
+arma_57$avar
+
+```
+
+### Forecast comparison:
+
+```{r FORECASTS}
+library(glue)
+ggplot(data=data_frame(index=seq(1,length(arma_57_forecasts$f)), forecast=arma_57_forecasts$f), aes(x=index, y=forecast)) +
+  geom_line(color="red")+
+  geom_point() + 
+  geom_line(data=data_frame(index=seq(1,length(actuals_57)), actuals=actuals_57), aes(x=index, y=actuals), color='green') +
+  ggtitle(glue('Seasonal Forecasts: ASE:{dollar(round(ASE_57, 0))} AIC:{round(arma_57$aic, 2)}')) + 
+  scale_y_continuous(labels = dollar)
+
+ggplot(data=data_frame(index=seq(1,length(arma_91_forecasts$f)), forecast=arma_91_forecasts$f), aes(x=index, y=forecast)) + 
+  geom_line(color='red') +
+  geom_point() + 
+  geom_line(data=data_frame(index=seq(1,length(actuals_91)), actuals=actuals_91), aes(x=index, y=actuals), color='green') +
+  ggtitle(glue('ARMA Forecasts: ASE:{dollar(round(ASE_91, 0))} AIC:{round(arma_91$aic, 2)}')) + 
+  scale_y_continuous(labels = dollar)
+
+
+
+
+
+```
+
+
+### Conclusion/Strategy For Further Analysis (.f):
+
+  Both models (ARMA(9,1) and ARUMA(5,7) s=7) performed relatively well. Forecasts for the ARMA model are oscillatory at first but eventually get attracted to the mean by the dominant MA component. The seasonal model forecasts a continuing cyclical pattern and is more likely representative of a model we would use in production. The ASE of the ARMA model was lower than the Seasonal as was the AIC - hence it is the preferred model. The fact that it also captures the factor tables very well is a huge plus. The seasonal model has a longer practical horizon and captures the 7 day changes very well. 
+  
+  The factor table for the ARMA model had frequencies that mapped very well to the original dataset, and the ARUMA model mapped very well to the spectral density of the transormed data. 
+  
+  Further analysis to be done on different time horizons (weekly, monthly, quarterly) and on different restaurants (other pizza chains etc).
